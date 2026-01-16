@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "VitalSource PDF Downloader",
+  "version": "1.1.0",
+  "description": "Download VitalSource books as PDF files",
+  "content_scripts": [
+    {
+      "matches": ["https://bookshelf.vitalsource.com/*"],
+      "js": ["jspdf.min.js", "content.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["iframe.js"],
+      "all_frames": true,
+      "run_at": "document_idle"
+    }
+  ],
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png",
+    "96": "icon96.png",
+    "128": "icon.png"
+  }
+}
