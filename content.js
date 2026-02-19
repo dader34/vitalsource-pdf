@@ -149,13 +149,26 @@
     }
 
     async function goToNextPage() {
-        const nextBtn = document.querySelector('[aria-label="Next"]');
-        if (!nextBtn) throw new Error('No Next button');
-        if (nextBtn.disabled || nextBtn.getAttribute('aria-disabled') === 'true') {
+        const input = document.querySelector('input[id^="text-field-"]');
+        if (!input) throw new Error('No page input found');
+
+        const current = parseInt(input.value, 10);
+        if (isNaN(current)) throw new Error('Cannot read current page');
+
+        const next = current + 1;
+
+        // Use the native setter to bypass React's controlled input
+        const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+        nativeSetter.call(input, String(next));
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.closest('form').dispatchEvent(new Event('submit', { bubbles: true }));
+
+        await sleep(1500);
+
+        // Check if we actually moved — if not, we're at the last page
+        if (parseInt(input.value, 10) === current) {
             throw new Error('Last page');
         }
-        nextBtn.click();
-        await sleep(1500);
     }
 
     // PDF generation
