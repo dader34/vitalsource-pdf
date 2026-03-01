@@ -61,13 +61,20 @@
         const canvas = document.createElement('canvas');
         canvas.width = img.naturalWidth;
         canvas.height = img.naturalHeight;
-        canvas.getContext('2d').drawImage(img, 0, 0);
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0);
 
-        return {
+        const result = {
             data: canvas.toDataURL('image/jpeg', 0.92),
             width: img.naturalWidth,
             height: img.naturalHeight,
         };
+
+        // Explicitly release canvas memory
+        canvas.width = 0;
+        canvas.height = 0;
+
+        return result;
     }
 
     // Accept messages from any origin since parent page and iframes
@@ -95,11 +102,11 @@
         }
     });
 
-    // Announce readiness multiple times for late-loading content
+    // Announce readiness multiple times for late-loading content, but only if we have an image
     const announceReady = () => {
-        sendToParent({ type: 'VS_IFRAME_READY', hasImage: hasPageImage(), url: currentUrl });
+        if (hasPageImage()) {
+            sendToParent({ type: 'VS_IFRAME_READY', hasImage: true, url: currentUrl });
+        }
     };
     [100, 500, 1000, 2000].forEach((delay) => setTimeout(announceReady, delay));
-
-    console.log('[VS-PDF] Iframe script loaded:', { url: currentUrl, hasImage: hasPageImage() });
 })();

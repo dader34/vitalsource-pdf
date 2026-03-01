@@ -8,10 +8,86 @@
 
     if (!window.location.href.includes('/reader/books/')) return;
 
-    console.log('[VS-PDF] Content script loaded');
+    console.log('[VS-PDF] Content script loaded (v2.0)');
+
+    // IndexedDB helpers for storing captured pages on disk instead of in memory
+    const pageDB = {
+        _db: null,
+        _dbName: 'vs_pdf_pages',
+        _storeName: 'pages',
+
+        async open() {
+            if (this._db) return this._db;
+            return new Promise((resolve, reject) => {
+                const request = indexedDB.open(this._dbName, 2);
+                request.onupgradeneeded = (e) => {
+                    const db = e.target.result;
+                    if (db.objectStoreNames.contains(this._storeName)) {
+                        db.deleteObjectStore(this._storeName);
+                    }
+                    db.createObjectStore(this._storeName, { autoIncrement: true });
+                };
+                request.onsuccess = (e) => {
+                    this._db = e.target.result;
+                    resolve(this._db);
+                };
+                request.onerror = () => reject(request.error);
+            });
+        },
+
+        async add(pageData) {
+            const db = await this.open();
+            return new Promise((resolve, reject) => {
+                const tx = db.transaction(this._storeName, 'readwrite');
+                const request = tx.objectStore(this._storeName).add(pageData);
+                request.onsuccess = () => resolve(request.result);
+                tx.onerror = () => reject(tx.error);
+            });
+        },
+
+        async getKeys() {
+            const db = await this.open();
+            return new Promise((resolve, reject) => {
+                const tx = db.transaction(this._storeName, 'readonly');
+                const request = tx.objectStore(this._storeName).getAllKeys();
+                request.onsuccess = () => resolve(request.result);
+                request.onerror = () => reject(request.error);
+            });
+        },
+
+        async get(key) {
+            const db = await this.open();
+            return new Promise((resolve, reject) => {
+                const tx = db.transaction(this._storeName, 'readonly');
+                const request = tx.objectStore(this._storeName).get(key);
+                request.onsuccess = () => resolve(request.result);
+                request.onerror = () => reject(request.error);
+            });
+        },
+
+        async count() {
+            const db = await this.open();
+            return new Promise((resolve, reject) => {
+                const tx = db.transaction(this._storeName, 'readonly');
+                const request = tx.objectStore(this._storeName).count();
+                request.onsuccess = () => resolve(request.result);
+                request.onerror = () => reject(request.error);
+            });
+        },
+
+        async clear() {
+            const db = await this.open();
+            return new Promise((resolve, reject) => {
+                const tx = db.transaction(this._storeName, 'readwrite');
+                tx.objectStore(this._storeName).clear();
+                tx.oncomplete = () => resolve();
+                tx.onerror = () => reject(tx.error);
+            });
+        },
+    };
 
     const state = {
-        capturedPages: [],
+        pageCount: 0,
         isRunning: false,
         readyFrames: [],
         pendingCaptures: {},
@@ -36,8 +112,9 @@
             resolve({ hasImage, url });
         }
 
-        if (type === 'VS_IFRAME_READY') {
-            console.log('[VS-PDF] Frame ready:', { hasImage, url });
+        if (type === 'VS_IFRAME_READY' && hasImage) {
+            // Keep only the most recent frames to prevent unbounded growth
+            if (state.readyFrames.length > 20) state.readyFrames = state.readyFrames.slice(-10);
             state.readyFrames.push({ hasImage, url });
         }
     });
@@ -148,25 +225,20 @@
         });
     }
 
-    async function goToNextPage() {
+    async function goToPage(pageNum) {
         const input = document.querySelector('input[id^="text-field-"]');
         if (!input) throw new Error('No page input found');
 
-        const current = parseInt(input.value, 10);
-        if (isNaN(current)) throw new Error('Cannot read current page');
+        const previousLabel = input.value;
 
-        const next = current + 1;
-
-        // Use the native setter to bypass React's controlled input
         const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-        nativeSetter.call(input, String(next));
+        nativeSetter.call(input, String(pageNum));
         input.dispatchEvent(new Event('input', { bubbles: true }));
         input.closest('form').dispatchEvent(new Event('submit', { bubbles: true }));
 
         await sleep(1500);
 
-        // Check if we actually moved — if not, we're at the last page
-        if (parseInt(input.value, 10) === current) {
+        if (input.value === previousLabel) {
             throw new Error('Last page');
         }
     }
@@ -213,7 +285,8 @@
     }
 
     async function generatePDF() {
-        if (state.capturedPages.length === 0) {
+        const totalPages = await pageDB.count();
+        if (totalPages === 0) {
             updateStatus('No pages captured!', 'error');
             return;
         }
@@ -222,27 +295,44 @@
         document.getElementById('vs-action').disabled = true;
 
         try {
+            let filename = document.getElementById('vs-filename').value.trim();
+            if (!filename) filename = sanitizeFilename(getBookTitle() || 'vitalsource-book');
+
             const { jsPDF } = window.jspdf;
             const pdf = new jsPDF({ orientation: 'portrait', unit: 'pt', format: 'letter' });
 
-            state.capturedPages.forEach((page, i) => {
+            let firstLabel = null;
+            let lastLabel = null;
+
+            // Get all keys, then load one page at a time in separate transactions
+            // so async yields don't kill the IDB transaction
+            const keys = await pageDB.getKeys();
+
+            for (let i = 0; i < keys.length; i++) {
                 if (i > 0) pdf.addPage('letter', 'portrait');
+
+                const page = await pageDB.get(keys[i]);
+
+                if (firstLabel === null) firstLabel = page.pageLabel || String(i + 1);
+                lastLabel = page.pageLabel || String(i + 1);
 
                 const dims = calculateImageDimensions(page.width, page.height);
                 pdf.addImage(page.data, 'JPEG', dims.offsetX, dims.offsetY, dims.drawWidth, dims.drawHeight);
 
-                updateProgress(i + 1, state.capturedPages.length);
-                updateStatus(`Building PDF: ${i + 1}/${state.capturedPages.length}`);
-            });
+                updateProgress(i + 1, totalPages);
+                updateStatus(`Building PDF: page ${i + 1}/${totalPages}`);
 
-            let filename = document.getElementById('vs-filename').value.trim();
-            if (!filename) filename = sanitizeFilename(getBookTitle() || 'vitalsource-book');
+                // Yield to the event loop every 5 pages to prevent UI freeze / tab kill
+                if (i % 5 === 4) await sleep(0);
+            }
 
-            const firstLabel = state.capturedPages[0].pageLabel || '1';
-            const lastLabel = state.capturedPages[state.capturedPages.length - 1].pageLabel || String(state.capturedPages.length);
             pdf.save(`${filename}_p${firstLabel}-${lastLabel}.pdf`);
 
-            updateStatus(`<strong>Download started!</strong><br>${state.capturedPages.length} pages saved.`, 'success');
+            // Clear stored pages after successful download
+            await pageDB.clear();
+            state.pageCount = 0;
+
+            updateStatus(`<strong>Download started!</strong><br>${totalPages} pages saved.`, 'success');
         } catch (e) {
             updateStatus(`PDF error: ${e.message}`, 'error');
         } finally {
@@ -272,12 +362,20 @@
 
         updateStatus('Starting capture...');
 
+        // Clear stale ready frames for fresh capture session
+        state.readyFrames = [];
+
+        // Read starting page number from the URL pageid
+        const startMatch = window.location.href.match(/\/pageid\/(\d+)/);
+        let currentPage = startMatch ? parseInt(startMatch[1], 10) : 0;
+
         let captured = 0;
         while (state.isRunning && captured < pageLimit) {
             try {
                 await sleep(500);
                 const pageData = await captureCurrentPage();
-                state.capturedPages.push(pageData);
+                await pageDB.add(pageData);
+                state.pageCount = await pageDB.count();
                 captured++;
 
                 const label = pageData.pageLabel || `#${captured}`;
@@ -286,18 +384,21 @@
                 updateProgress(captured, pageLimit);
 
                 if (captured >= pageLimit) {
-                    updateStatus(`Done! ${state.capturedPages.length} pages captured.`, 'success');
+                    updateStatus(`Done! ${state.pageCount} pages captured.`, 'success');
                     break;
                 }
 
-                await goToNextPage();
+                currentPage++;
+                await goToPage(currentPage);
             } catch (e) {
                 if (e.message === 'Last page') {
-                    updateStatus(`Done! ${state.capturedPages.length} pages captured.`, 'success');
+                    state.pageCount = await pageDB.count();
+                    updateStatus(`Done! ${state.pageCount} pages captured.`, 'success');
                     break;
                 }
                 updateStatus(`Error on page ${captured + 1}: ${e.message}`, 'error');
-                try { await goToNextPage(); } catch { break; }
+                currentPage++;
+                try { await goToPage(currentPage); } catch { break; }
             }
         }
 
@@ -324,9 +425,9 @@
     function updateModalUI() {
         const actionBtn = document.getElementById('vs-action');
         const clearBtn = document.getElementById('vs-clear');
-        document.getElementById('vs-page-count').textContent = state.capturedPages.length;
+        document.getElementById('vs-page-count').textContent = state.pageCount;
 
-        if (state.capturedPages.length > 0) {
+        if (state.pageCount > 0) {
             clearBtn.style.display = 'block';
             actionBtn.textContent = state.isRunning ? 'Stop' : 'Download PDF';
         } else {
@@ -484,14 +585,15 @@
             if (state.isRunning) {
                 state.isRunning = false;
                 updateModalUI();
-            } else if (state.capturedPages.length > 0) {
+            } else if (state.pageCount > 0) {
                 generatePDF();
             } else {
                 startCapture();
             }
         });
-        document.getElementById('vs-clear').addEventListener('click', () => {
-            state.capturedPages = [];
+        document.getElementById('vs-clear').addEventListener('click', async () => {
+            await pageDB.clear();
+            state.pageCount = 0;
             updateModalUI();
             updateProgress(0, 1);
             updateStatus('Cleared all pages.', 'info');
@@ -501,8 +603,10 @@
         if (title) document.getElementById('vs-filename').value = sanitizeFilename(title);
     }
 
-    function showModal() {
+    async function showModal() {
         if (!state.modal) createModal();
+        // Sync page count from IndexedDB (may have pages from a previous session)
+        state.pageCount = await pageDB.count();
         state.modal.classList.add('visible');
         updateModalUI();
     }
