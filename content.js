@@ -97,25 +97,29 @@
     // Message handling — accept messages from any origin since iframes
     // may be hosted on CDN domains outside vitalsource.com
     window.addEventListener('message', (event) => {
-        const { type, requestId, success, data, error, hasImage, url } = event.data || {};
+        const { type, requestId, success, data, error, hasImage, hasContent, contentType, url } = event.data || {};
         if (!type || !type.startsWith('VS_')) return;
 
         if (type === 'VS_PAGE_CAPTURED' && requestId && state.pendingCaptures[requestId]) {
             const { resolve, reject } = state.pendingCaptures[requestId];
             delete state.pendingCaptures[requestId];
-            success ? resolve(data) : reject(new Error(error || 'Capture failed'));
+            if (success) {
+                resolve(event.data.isMultiPage ? { pages: data, isMultiPage: true } : data);
+            } else {
+                reject(new Error(error || 'Capture failed'));
+            }
         }
 
-        if (type === 'VS_PONG' && requestId && state.pendingCaptures[requestId] && hasImage) {
+        if (type === 'VS_PONG' && requestId && state.pendingCaptures[requestId] && (hasImage || hasContent)) {
             const { resolve } = state.pendingCaptures[requestId];
             delete state.pendingCaptures[requestId];
-            resolve({ hasImage, url });
+            resolve({ hasImage, hasContent, contentType, url });
         }
 
-        if (type === 'VS_IFRAME_READY' && hasImage) {
+        if (type === 'VS_IFRAME_READY' && (hasImage || hasContent)) {
             // Keep only the most recent frames to prevent unbounded growth
             if (state.readyFrames.length > 20) state.readyFrames = state.readyFrames.slice(-10);
-            state.readyFrames.push({ hasImage, url });
+            state.readyFrames.push({ hasImage, hasContent, contentType, url });
         }
     });
 
@@ -171,15 +175,15 @@
     }
 
     async function pingIframe() {
-        const readyWithImage = state.readyFrames.find((f) => f?.hasImage);
-        if (readyWithImage) return readyWithImage;
+        const readyWithContent = state.readyFrames.find((f) => f?.hasImage || f?.hasContent);
+        if (readyWithContent) return readyWithContent;
 
         const requestId = 'ping_' + Date.now();
         return new Promise((resolve, reject) => {
             const timeout = setTimeout(() => {
                 delete state.pendingCaptures[requestId];
-                const ready = state.readyFrames.find((f) => f?.hasImage);
-                ready ? resolve(ready) : reject(new Error('No iframe with page image found. Try reloading.'));
+                const ready = state.readyFrames.find((f) => f?.hasImage || f?.hasContent);
+                ready ? resolve(ready) : reject(new Error('No iframe with page content found. Try reloading.'));
             }, 5000);
 
             state.pendingCaptures[requestId] = {
@@ -200,7 +204,7 @@
                 if (resolved) return;
                 delete state.pendingCaptures[requestId];
                 reject(new Error('Capture timeout'));
-            }, 15000);
+            }, 60000);
 
             state.pendingCaptures[requestId] = {
                 resolve: (data) => {
@@ -208,8 +212,12 @@
                     resolved = true;
                     clearTimeout(timeout);
                     delete state.pendingCaptures[requestId];
-                    data.timestamp = Date.now();
-                    data.pageLabel = getCurrentPageLabel();
+                    if (data.isMultiPage) {
+                        data.pageLabel = getCurrentPageLabel();
+                    } else {
+                        data.timestamp = Date.now();
+                        data.pageLabel = getCurrentPageLabel();
+                    }
                     resolve(data);
                 },
                 reject: (err) => {
@@ -225,21 +233,36 @@
         });
     }
 
-    async function goToPage(pageNum) {
-        const input = document.querySelector('input[id^="text-field-"]');
-        if (!input) throw new Error('No page input found');
+    async function goToNextPage() {
+        // Wait for the Next button to be present and enabled (it can temporarily
+        // disappear or become disabled during EPUB chapter transitions)
+        let nextBtn = null;
+        for (let i = 0; i < 20; i++) {
+            nextBtn = document.querySelector('button[aria-label="Next"]');
+            if (nextBtn && !nextBtn.disabled) break;
+            nextBtn = null;
+            await sleep(500);
+        }
+        if (!nextBtn) throw new Error('Last page');
 
-        const previousLabel = input.value;
+        // Clear ready frames so we can detect when new content loads
+        state.readyFrames = [];
 
-        const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-        nativeSetter.call(input, String(pageNum));
-        input.dispatchEvent(new Event('input', { bubbles: true }));
-        input.closest('form').dispatchEvent(new Event('submit', { bubbles: true }));
+        nextBtn.click();
 
-        await sleep(1500);
+        // Wait for new content to load via iframe ready signal
+        for (let waited = 0; waited < 10000; waited += 300) {
+            await sleep(300);
+            if (state.readyFrames.some((f) => f?.hasImage || f?.hasContent)) {
+                return;
+            }
+        }
 
-        if (input.value === previousLabel) {
-            throw new Error('Last page');
+        // No ready signal received — actively ping to check if content is there
+        try {
+            await pingIframe();
+        } catch {
+            await sleep(2000);
         }
     }
 
@@ -262,21 +285,29 @@
 
     async function downloadCurrentPageDirect() {
         try {
-            if (!state.readyFrames.find((f) => f?.hasImage)) {
+            if (!state.readyFrames.find((f) => f?.hasImage || f?.hasContent)) {
                 await pingIframe();
             }
 
             const pageData = await captureCurrentPage();
             const { jsPDF } = window.jspdf;
             const pdf = new jsPDF({ orientation: 'portrait', unit: 'pt', format: 'letter' });
-
-            const dims = calculateImageDimensions(pageData.width, pageData.height);
-            pdf.addImage(pageData.data, 'JPEG', dims.offsetX, dims.offsetY, dims.drawWidth, dims.drawHeight);
-
             const filename = sanitizeFilename(getBookTitle() || 'vitalsource');
             const pageLabel = pageData.pageLabel || getCurrentPageLabel() || '1';
-            pdf.save(`${filename}_page${pageLabel}.pdf`);
 
+            if (pageData.isMultiPage) {
+                for (let i = 0; i < pageData.pages.length; i++) {
+                    if (i > 0) pdf.addPage('letter', 'portrait');
+                    const page = pageData.pages[i];
+                    const dims = calculateImageDimensions(page.width, page.height);
+                    pdf.addImage(page.data, 'JPEG', dims.offsetX, dims.offsetY, dims.drawWidth, dims.drawHeight);
+                }
+            } else {
+                const dims = calculateImageDimensions(pageData.width, pageData.height);
+                pdf.addImage(pageData.data, 'JPEG', dims.offsetX, dims.offsetY, dims.drawWidth, dims.drawHeight);
+            }
+
+            pdf.save(`${filename}_page${pageLabel}.pdf`);
             console.log('[VS-PDF] Downloaded page', pageLabel);
         } catch (e) {
             console.error('[VS-PDF] Download failed:', e);
@@ -365,31 +396,43 @@
         // Clear stale ready frames for fresh capture session
         state.readyFrames = [];
 
-        // Read starting page number from the URL pageid
-        const startMatch = window.location.href.match(/\/pageid\/(\d+)/);
-        let currentPage = startMatch ? parseInt(startMatch[1], 10) : 0;
-
         let captured = 0;
         while (state.isRunning && captured < pageLimit) {
             try {
                 await sleep(500);
                 const pageData = await captureCurrentPage();
-                await pageDB.add(pageData);
-                state.pageCount = await pageDB.count();
-                captured++;
 
-                const label = pageData.pageLabel || `#${captured}`;
-                updateModalUI();
-                updateStatus(`Captured page ${label} (${captured}/${pageLimit})`);
-                updateProgress(captured, pageLimit);
+                if (pageData.isMultiPage) {
+                    // EPUB: multiple viewport-sized screenshots per chapter
+                    for (const page of pageData.pages) {
+                        page.timestamp = Date.now();
+                        page.pageLabel = pageData.pageLabel;
+                        await pageDB.add(page);
+                    }
+                    state.pageCount = await pageDB.count();
+                    captured++;
+
+                    const label = pageData.pageLabel || `#${captured}`;
+                    updateModalUI();
+                    updateStatus(`Captured chapter ${label} — ${pageData.pages.length} pages (${captured}/${pageLimit} chapters)`);
+                    updateProgress(captured, pageLimit);
+                } else {
+                    await pageDB.add(pageData);
+                    state.pageCount = await pageDB.count();
+                    captured++;
+
+                    const label = pageData.pageLabel || `#${captured}`;
+                    updateModalUI();
+                    updateStatus(`Captured page ${label} (${captured}/${pageLimit})`);
+                    updateProgress(captured, pageLimit);
+                }
 
                 if (captured >= pageLimit) {
                     updateStatus(`Done! ${state.pageCount} pages captured.`, 'success');
                     break;
                 }
 
-                currentPage++;
-                await goToPage(currentPage);
+                await goToNextPage();
             } catch (e) {
                 if (e.message === 'Last page') {
                     state.pageCount = await pageDB.count();
@@ -397,8 +440,7 @@
                     break;
                 }
                 updateStatus(`Error on page ${captured + 1}: ${e.message}`, 'error');
-                currentPage++;
-                try { await goToPage(currentPage); } catch { break; }
+                try { await goToNextPage(); } catch { break; }
             }
         }
 
@@ -682,7 +724,7 @@
         const info = {
             url: window.location.href,
             userAgent: navigator.userAgent,
-            extensionVersion: '1.2.1',
+            extensionVersion: '1.4.0',
             extensionLoaded: !!document.getElementById('vs-download-page-btn'),
             windowFrames: window.frames.length,
             iframes: [],
@@ -715,7 +757,7 @@
         const listener = (event) => {
             const d = event.data;
             if (d?.type === 'VS_PONG' || d?.type === 'VS_IFRAME_READY') {
-                responses.push({ type: d.type, hasImage: d.hasImage, url: d.url });
+                responses.push({ type: d.type, hasImage: d.hasImage, hasContent: d.hasContent, contentType: d.contentType, url: d.url });
             }
         };
         window.addEventListener('message', listener);
@@ -737,8 +779,11 @@
             info.summary = 'NO RESPONSE: iframe.js is not running in any iframe. The extension may not be injecting scripts into cross-origin iframes.';
         } else if (responses.some(r => r.hasImage)) {
             info.summary = 'OK: iframe.js is running and found page images.';
+        } else if (responses.some(r => r.hasContent)) {
+            const epubCount = responses.filter(r => r.contentType === 'epub').length;
+            info.summary = `OK: iframe.js is running and found EPUB content (${epubCount} epub frame${epubCount !== 1 ? 's' : ''}).`;
         } else {
-            info.summary = 'PARTIAL: iframe.js is running but no iframe reported having a page image.';
+            info.summary = 'PARTIAL: iframe.js is running but no iframe reported having page content.';
         }
 
         return info;
