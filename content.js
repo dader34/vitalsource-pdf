@@ -677,7 +677,206 @@
         console.log('[VS-PDF] Header download button injected');
     }
 
+    // Diagnostics
+    async function runDiagnostics() {
+        const info = {
+            url: window.location.href,
+            userAgent: navigator.userAgent,
+            extensionVersion: '1.2.1',
+            extensionLoaded: !!document.getElementById('vs-download-page-btn'),
+            windowFrames: window.frames.length,
+            iframes: [],
+            mosaicBook: !!document.querySelector('mosaic-book'),
+            pageInput: null,
+            iframeScriptResponses: [],
+        };
+
+        document.querySelectorAll('iframe').forEach(f => {
+            const entry = { src: f.src, width: f.offsetWidth, height: f.offsetHeight, accessible: false };
+            try { if (f.contentDocument) entry.accessible = true; } catch {}
+            info.iframes.push(entry);
+        });
+
+        const shadowIframes = [];
+        document.querySelectorAll('*').forEach(el => {
+            if (el.shadowRoot) {
+                el.shadowRoot.querySelectorAll('iframe').forEach(f => {
+                    shadowIframes.push({ host: el.tagName, src: f.src });
+                });
+            }
+        });
+        if (shadowIframes.length) info.shadowIframes = shadowIframes;
+
+        const input = document.querySelector('input[id^="text-field-"]');
+        info.pageInput = input ? { id: input.id, value: input.value } : null;
+
+        // Ping iframes
+        const responses = [];
+        const listener = (event) => {
+            const d = event.data;
+            if (d?.type === 'VS_PONG' || d?.type === 'VS_IFRAME_READY') {
+                responses.push({ type: d.type, hasImage: d.hasImage, url: d.url });
+            }
+        };
+        window.addEventListener('message', listener);
+
+        const msg = { type: 'VS_PING', requestId: 'diag_' + Date.now() };
+        for (let i = 0; i < window.frames.length; i++) {
+            try { window.frames[i].postMessage(msg, '*'); } catch {}
+        }
+        document.querySelectorAll('iframe').forEach(f => {
+            try { f.contentWindow.postMessage(msg, '*'); } catch {}
+        });
+
+        await sleep(5000);
+        window.removeEventListener('message', listener);
+
+        info.iframeScriptResponses = responses;
+
+        if (responses.length === 0) {
+            info.summary = 'NO RESPONSE: iframe.js is not running in any iframe. The extension may not be injecting scripts into cross-origin iframes.';
+        } else if (responses.some(r => r.hasImage)) {
+            info.summary = 'OK: iframe.js is running and found page images.';
+        } else {
+            info.summary = 'PARTIAL: iframe.js is running but no iframe reported having a page image.';
+        }
+
+        return info;
+    }
+
+    function showDiagnosticResults(info) {
+        let overlay = document.getElementById('vs-diag-overlay');
+        if (overlay) overlay.remove();
+
+        overlay = document.createElement('div');
+        overlay.id = 'vs-diag-overlay';
+
+        const jsonText = JSON.stringify(info, null, 2);
+        const statusColor = info.summary?.startsWith('OK') ? '#137333'
+            : info.summary?.startsWith('PARTIAL') ? '#b45309' : '#c5221f';
+
+        overlay.innerHTML = `
+            <style>
+                #vs-diag-overlay {
+                    display: flex; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+                    background: rgba(0,0,0,0.6); z-index: 9999999; align-items: center; justify-content: center;
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                }
+                #vs-diag-overlay .diag-content {
+                    background: #fff; border-radius: 12px; padding: 24px; width: 560px; max-width: 90vw;
+                    max-height: 80vh; display: flex; flex-direction: column; box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+                }
+                #vs-diag-overlay h2 { margin: 0 0 8px; font-size: 18px; font-weight: 600; color: #1a1a1a; }
+                #vs-diag-overlay .diag-summary {
+                    padding: 10px 14px; border-radius: 8px; font-size: 13px; font-weight: 500;
+                    margin-bottom: 12px; background: #f0f0f0;
+                }
+                #vs-diag-overlay pre {
+                    flex: 1; overflow: auto; background: #1e1e1e; color: #d4d4d4; padding: 16px;
+                    border-radius: 8px; font-size: 12px; line-height: 1.5; margin: 0; white-space: pre-wrap;
+                    word-break: break-all;
+                }
+                #vs-diag-overlay .diag-buttons { display: flex; gap: 12px; margin-top: 16px; }
+                #vs-diag-overlay button {
+                    padding: 10px 20px; border: none; border-radius: 8px;
+                    font-size: 14px; font-weight: 600; cursor: pointer;
+                }
+                #vs-diag-overlay .btn-copy { background: #4a90d9; color: white; flex: 1; }
+                #vs-diag-overlay .btn-copy:hover { background: #3a7bc8; }
+                #vs-diag-overlay .btn-copy.copied { background: #137333; }
+                #vs-diag-overlay .btn-close { background: #f0f0f0; color: #333; }
+                #vs-diag-overlay .btn-close:hover { background: #e0e0e0; }
+                #vs-diag-overlay .diag-hint {
+                    font-size: 12px; color: #888; margin-top: 8px; text-align: center;
+                }
+            </style>
+            <div class="diag-content">
+                <h2>Extension Diagnostics</h2>
+                <div class="diag-summary" style="color: ${statusColor}">${info.summary || 'Unknown'}</div>
+                <pre>${jsonText}</pre>
+                <div class="diag-buttons">
+                    <button class="btn-close" id="vs-diag-close">Close</button>
+                    <button class="btn-copy" id="vs-diag-copy">Copy to Clipboard</button>
+                </div>
+                <div class="diag-hint">Copy and send this to the developer for troubleshooting</div>
+            </div>
+        `;
+
+        document.body.appendChild(overlay);
+
+        overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+        document.getElementById('vs-diag-close').addEventListener('click', () => overlay.remove());
+        document.getElementById('vs-diag-copy').addEventListener('click', async () => {
+            const btn = document.getElementById('vs-diag-copy');
+            try {
+                await navigator.clipboard.writeText(jsonText);
+                btn.textContent = 'Copied!';
+                btn.classList.add('copied');
+                setTimeout(() => { btn.textContent = 'Copy to Clipboard'; btn.classList.remove('copied'); }, 2000);
+            } catch {
+                // Fallback
+                const ta = document.createElement('textarea');
+                ta.value = jsonText;
+                document.body.appendChild(ta);
+                ta.select();
+                document.execCommand('copy');
+                ta.remove();
+                btn.textContent = 'Copied!';
+                btn.classList.add('copied');
+                setTimeout(() => { btn.textContent = 'Copy to Clipboard'; btn.classList.remove('copied'); }, 2000);
+            }
+        });
+    }
+
+    // Inject "Diagnostics" into More Options popover
+    function injectDiagnosticsMenuItem() {
+        const observer = new MutationObserver(() => {
+            // Look for the popover content that appears when "More Options" is clicked
+            const popovers = document.querySelectorAll('[id^="popover-"]');
+            popovers.forEach(popover => {
+                if (popover.querySelector('#vs-diagnostics-item')) return;
+                // Find the menu list inside the popover
+                const menuList = popover.querySelector('ul, [role="menu"], [role="listbox"]');
+                if (!menuList) return;
+
+                const li = document.createElement('li');
+                li.id = 'vs-diagnostics-item';
+                // Clone styling from existing menu items
+                const existingItem = menuList.querySelector('li');
+                if (existingItem) li.className = existingItem.className;
+
+                const existingBtn = existingItem?.querySelector('button, a, [role="menuitem"]');
+                const btnTag = existingBtn ? existingBtn.tagName.toLowerCase() : 'button';
+                const btnClass = existingBtn?.className || '';
+
+                li.innerHTML = `<${btnTag} class="${btnClass}" style="width:100%;text-align:left;cursor:pointer;">
+                    <span style="display:flex;align-items:center;gap:8px;">
+                        <svg viewBox="0 0 16 16" style="width:16px;height:16px;flex-shrink:0;" fill="currentColor">
+                            <path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm0 12.5a5.5 5.5 0 1 1 0-11 5.5 5.5 0 0 1 0 11zM7.25 5h1.5v4h-1.5V5zm0 5h1.5v1.5h-1.5V10z"/>
+                        </svg>
+                        <span>Diagnostics</span>
+                    </span>
+                </${btnTag}>`;
+
+                menuList.appendChild(li);
+
+                li.addEventListener('click', async (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    // Close the popover by clicking elsewhere
+                    document.body.click();
+                    updateStatus('Running diagnostics (5s)...', 'info');
+                    const info = await runDiagnostics();
+                    showDiagnosticResults(info);
+                });
+            });
+        });
+
+        observer.observe(document.body, { childList: true, subtree: true });
+    }
+
     // Initialize
     injectHeaderButton();
+    injectDiagnosticsMenuItem();
     console.log('[VS-PDF] Initialized');
 })();
