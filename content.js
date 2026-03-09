@@ -330,40 +330,55 @@
             if (!filename) filename = sanitizeFilename(getBookTitle() || 'vitalsource-book');
 
             const { jsPDF } = window.jspdf;
-            const pdf = new jsPDF({ orientation: 'portrait', unit: 'pt', format: 'letter' });
-
-            let firstLabel = null;
-            let lastLabel = null;
-
-            // Get all keys, then load one page at a time in separate transactions
-            // so async yields don't kill the IDB transaction
             const keys = await pageDB.getKeys();
 
-            for (let i = 0; i < keys.length; i++) {
-                if (i > 0) pdf.addPage('letter', 'portrait');
+            // Split into chunks to avoid memory/string length errors on large books
+            const PAGES_PER_PDF = 200;
+            const totalChunks = Math.ceil(keys.length / PAGES_PER_PDF);
+            let filesCreated = 0;
 
-                const page = await pageDB.get(keys[i]);
+            for (let chunk = 0; chunk < totalChunks; chunk++) {
+                const startIdx = chunk * PAGES_PER_PDF;
+                const endIdx = Math.min(startIdx + PAGES_PER_PDF, keys.length);
+                const chunkKeys = keys.slice(startIdx, endIdx);
 
-                if (firstLabel === null) firstLabel = page.pageLabel || String(i + 1);
-                lastLabel = page.pageLabel || String(i + 1);
+                const pdf = new jsPDF({ orientation: 'portrait', unit: 'pt', format: 'letter' });
+                let firstLabel = null;
+                let lastLabel = null;
 
-                const dims = calculateImageDimensions(page.width, page.height);
-                pdf.addImage(page.data, 'JPEG', dims.offsetX, dims.offsetY, dims.drawWidth, dims.drawHeight);
+                for (let j = 0; j < chunkKeys.length; j++) {
+                    if (j > 0) pdf.addPage('letter', 'portrait');
 
-                updateProgress(i + 1, totalPages);
-                updateStatus(`Building PDF: page ${i + 1}/${totalPages}`);
+                    const page = await pageDB.get(chunkKeys[j]);
+                    const globalIdx = startIdx + j;
 
-                // Yield to the event loop every 5 pages to prevent UI freeze / tab kill
-                if (i % 5 === 4) await sleep(0);
+                    if (firstLabel === null) firstLabel = page.pageLabel || String(globalIdx + 1);
+                    lastLabel = page.pageLabel || String(globalIdx + 1);
+
+                    const dims = calculateImageDimensions(page.width, page.height);
+                    pdf.addImage(page.data, 'JPEG', dims.offsetX, dims.offsetY, dims.drawWidth, dims.drawHeight);
+
+                    updateProgress(globalIdx + 1, totalPages);
+                    const chunkLabel = totalChunks > 1 ? ` (part ${chunk + 1}/${totalChunks})` : '';
+                    updateStatus(`Building PDF${chunkLabel}: page ${globalIdx + 1}/${totalPages}`);
+
+                    if (j % 5 === 4) await sleep(0);
+                }
+
+                const partSuffix = totalChunks > 1 ? `_part${chunk + 1}` : '';
+                pdf.save(`${filename}_p${firstLabel}-${lastLabel}${partSuffix}.pdf`);
+                filesCreated++;
+
+                // Yield between chunks to let the browser reclaim memory
+                if (chunk < totalChunks - 1) await sleep(500);
             }
-
-            pdf.save(`${filename}_p${firstLabel}-${lastLabel}.pdf`);
 
             // Clear stored pages after successful download
             await pageDB.clear();
             state.pageCount = 0;
 
-            updateStatus(`<strong>Download started!</strong><br>${totalPages} pages saved.`, 'success');
+            const partMsg = totalChunks > 1 ? ` in ${totalChunks} files` : '';
+            updateStatus(`<strong>Download started!</strong><br>${totalPages} pages saved${partMsg}.`, 'success');
         } catch (e) {
             updateStatus(`PDF error: ${e.message}`, 'error');
         } finally {
@@ -724,7 +739,7 @@
         const info = {
             url: window.location.href,
             userAgent: navigator.userAgent,
-            extensionVersion: '1.4.0',
+            extensionVersion: '1.4.1',
             extensionLoaded: !!document.getElementById('vs-download-page-btn'),
             windowFrames: window.frames.length,
             iframes: [],
